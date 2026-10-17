@@ -8,9 +8,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from Dataloader import *
+from Dataloader import load_data, preprocess_data_with_time
 from model import TSEDGCA
-from utils import metric
+from utils import load_tsedgca_state_dict, metric
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,10 +23,8 @@ parser.add_argument('--pre_len', type=int, default=12, help="The length of outpu
 parser.add_argument('--batchsize', type=int, default=16, help="Number of testing batches")
 parser.add_argument('--heads', type=int, default=4, help="The number of heads of multi-head attention")
 parser.add_argument('--dropout', type=float, default=0, help="Dropout")
-parser.add_argument('--lr', type=float, default=0.0001, help="Learning rate")
 parser.add_argument('--in_dim', type=int, default=1, help="Dimensionality of input data")
 parser.add_argument('--embed_size', type=int, default=64, help="Embed_size")
-parser.add_argument('--epochs', type=int, default=100, help="epochs")
 parser.add_argument(
     '--model',
     type=str,
@@ -42,15 +40,15 @@ if __name__ == "__main__":
     data1 = np.mat(data, dtype=np.float32)
 
     (
-        trainX, trainY, trainTOD, trainDOW, trainFTOD, trainFDOW,
-        valX, valY, valTOD, valDOW, valFTOD, valFDOW,
-        testX, testY, testTOD, testDOW, testFTOD, testFDOW,
+        trainX, trainY, trainTOD, trainDOW,
+        valX, valY, valTOD, valDOW,
+        testX, testY, testTOD, testDOW,
         mean, std
     ) = preprocess_data_with_time(
         data1, time_len, args.train_rate, args.seq_len, args.pre_len
     )
 
-    test_data = TensorDataset(testX, testY, testTOD, testDOW, testFTOD, testFDOW)
+    test_data = TensorDataset(testX, testY, testTOD, testDOW)
     test_dataloader = DataLoader(test_data, batch_size=args.batchsize)
 
     model = TSEDGCA(
@@ -61,7 +59,9 @@ if __name__ == "__main__":
     )
 
     state_dict = torch.load(args.model, map_location=device)
-    model.load_state_dict(state_dict)
+    retired_keys = load_tsedgca_state_dict(model, state_dict)
+    if retired_keys:
+        print("Ignored {} retired checkpoint parameters.".format(len(retired_keys)))
     model = model.to(device)
     model.eval()
 
@@ -69,19 +69,14 @@ if __name__ == "__main__":
     L = []
 
     with torch.no_grad():
-        for x, y, tod_ids, dow_ids, future_tod_ids, future_dow_ids in test_dataloader:
+        for x, y, tod_ids, dow_ids in test_dataloader:
             x = x.to(device)
             tod_ids = tod_ids.to(device).long()
             dow_ids = dow_ids.to(device).long()
-            future_tod_ids = future_tod_ids.to(device).long()
-            future_dow_ids = future_dow_ids.to(device).long()
-
             out = model(
                 x,
                 tod_ids=tod_ids,
-                dow_ids=dow_ids,
-                future_tod_ids=future_tod_ids,
-                future_dow_ids=future_dow_ids
+                dow_ids=dow_ids
             )
 
             if isinstance(out, tuple):
@@ -96,9 +91,6 @@ if __name__ == "__main__":
 
     if hasattr(model, "calendar_emb_scale"):
         print("input calendar scale:", torch.sigmoid(model.calendar_emb_scale).item())
-    if hasattr(model, "future_time_scale"):
-        print("future calendar scale:", torch.sigmoid(model.future_time_scale).item())
-
     if hasattr(model, "ST1") and hasattr(model.ST1, "increment_temporal"):
         if hasattr(model.ST1.increment_temporal, "last_delta_strength") and model.ST1.increment_temporal.last_delta_strength is not None:
             print("ST1 delta strength:", model.ST1.increment_temporal.last_delta_strength.item())

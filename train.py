@@ -6,7 +6,7 @@ import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from Dataloader import *
+from Dataloader import load_data, preprocess_data_with_time
 from model import TSEDGCA
 from utils import metric
 import argparse
@@ -34,18 +34,18 @@ if __name__ == "__main__":
     data1 = np.mat(data, dtype=np.float32)
 
     (
-        trainX, trainY, trainTOD, trainDOW, trainFTOD, trainFDOW,
-        valX, valY, valTOD, valDOW, valFTOD, valFDOW,
-        testX, testY, testTOD, testDOW, testFTOD, testFDOW,
+        trainX, trainY, trainTOD, trainDOW,
+        valX, valY, valTOD, valDOW,
+        testX, testY, testTOD, testDOW,
         mean, std
     ) = preprocess_data_with_time(
         data1, time_len, args.train_rate, args.seq_len, args.pre_len
     )
 
-    train_data = TensorDataset(trainX, trainY, trainTOD, trainDOW, trainFTOD, trainFDOW)
+    train_data = TensorDataset(trainX, trainY, trainTOD, trainDOW)
     train_dataloader = DataLoader(train_data, batch_size=args.batchsize, shuffle=True)
 
-    val_data = TensorDataset(valX, valY, valTOD, valDOW, valFTOD, valFDOW)
+    val_data = TensorDataset(valX, valY, valTOD, valDOW)
     val_dataloader = DataLoader(val_data, batch_size=args.batchsize)
 
     model = TSEDGCA(
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     model = model.to(device)
     criterion = nn.MSELoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     best_mae = 100
     best_rmse = None
@@ -66,20 +66,15 @@ if __name__ == "__main__":
 
     for epoch in range(args.epochs):
         model.train()
-        for x, y, tod_ids, dow_ids, future_tod_ids, future_dow_ids in train_dataloader:
+        for x, y, tod_ids, dow_ids in train_dataloader:
             x = x.to(device)
             y = y.to(device)
             tod_ids = tod_ids.to(device).long()
             dow_ids = dow_ids.to(device).long()
-            future_tod_ids = future_tod_ids.to(device).long()
-            future_dow_ids = future_dow_ids.to(device).long()
-
             pre = model(
                 x,
                 tod_ids=tod_ids,
-                dow_ids=dow_ids,
-                future_tod_ids=future_tod_ids,
-                future_dow_ids=future_dow_ids
+                dow_ids=dow_ids
             ).reshape(-1, adj.shape[0])
 
             y = y.reshape(-1, adj.shape[0])
@@ -93,19 +88,14 @@ if __name__ == "__main__":
         P = []
         L = []
         with torch.no_grad():
-            for x, y, tod_ids, dow_ids, future_tod_ids, future_dow_ids in val_dataloader:
+            for x, y, tod_ids, dow_ids in val_dataloader:
                 x = x.to(device)
                 tod_ids = tod_ids.to(device).long()
                 dow_ids = dow_ids.to(device).long()
-                future_tod_ids = future_tod_ids.to(device).long()
-                future_dow_ids = future_dow_ids.to(device).long()
-
                 pre = model(
                     x,
                     tod_ids=tod_ids,
-                    dow_ids=dow_ids,
-                    future_tod_ids=future_tod_ids,
-                    future_dow_ids=future_dow_ids
+                    dow_ids=dow_ids
                 ) * std + mean
 
                 P.append(pre.cpu().detach())

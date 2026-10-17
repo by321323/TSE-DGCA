@@ -1,13 +1,11 @@
 # TSE-DGCA
 
-Source code for traffic forecasting with dynamic graph construction, graph convolution, attention, and incremental temporal-evolution components.
+Source code for traffic forecasting with dynamic graph construction, graph convolution, attention, historical time-of-day/day-of-week embeddings, and incremental temporal-evolution components.
 
 ## Requirements
 
 - Python 3.7
 - PyTorch 1.7.1
-- SciPy 1.7.0
-- pandas 1.3.1
 - NumPy 1.20.3
 
 Install the Python dependencies with:

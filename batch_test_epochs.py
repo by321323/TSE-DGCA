@@ -22,12 +22,13 @@ import glob
 import argparse
 import warnings
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from Dataloader import *
+from Dataloader import load_data, preprocess_data_with_time
 from model import TSEDGCA
-from utils import metric
+from utils import load_tsedgca_state_dict, metric
 
 warnings.filterwarnings("ignore")
 
@@ -100,28 +101,18 @@ def build_dataloaders(args):
     time_len = data.shape[0]
     data1 = np.mat(data, dtype=np.float32)
 
-    # 优先使用带历史/未来 TOD-DOW 的接口；没有则自动退回旧接口
-    if 'preprocess_data_with_time' in globals():
-        results = preprocess_data_with_time(
-            data1, time_len, args.train_rate, args.seq_len, args.pre_len
-        )
-        (
-            trainX, trainY, trainTOD, trainDOW, trainFTOD, trainFDOW,
-            valX, valY, valTOD, valDOW, valFTOD, valFDOW,
-            testX, testY, testTOD, testDOW, testFTOD, testFDOW,
-            mean, std
-        ) = results
+    (
+        trainX, trainY, trainTOD, trainDOW,
+        valX, valY, valTOD, valDOW,
+        testX, testY, testTOD, testDOW,
+        mean, std
+    ) = preprocess_data_with_time(
+        data1, time_len, args.train_rate, args.seq_len, args.pre_len
+    )
 
-        test_data = TensorDataset(testX, testY, testTOD, testDOW, testFTOD, testFDOW)
-        val_data = TensorDataset(valX, valY, valTOD, valDOW, valFTOD, valFDOW)
-        time_mode = 'history_and_future_tod_dow'
-    else:
-        trainX, trainY, valX, valY, testX, testY, mean, std = preprocess_data(
-            data1, time_len, args.train_rate, args.seq_len, args.pre_len
-        )
-        test_data = TensorDataset(testX, testY)
-        val_data = TensorDataset(valX, valY)
-        time_mode = 'no_tod_dow'
+    test_data = TensorDataset(testX, testY, testTOD, testDOW)
+    val_data = TensorDataset(valX, valY, valTOD, valDOW)
+    time_mode = 'history_tod_dow'
 
     test_loader = DataLoader(test_data, batch_size=args.batchsize, shuffle=False)
     val_loader = DataLoader(val_data, batch_size=args.batchsize, shuffle=False)
@@ -129,30 +120,13 @@ def build_dataloaders(args):
 
 
 def forward_by_batch(model, batch, device):
-    if len(batch) == 2:
-        x, y = batch
-        x = x.to(device)
-        pred = model(x)
-    elif len(batch) == 4:
-        x, y, tod_ids, dow_ids = batch
-        x = x.to(device)
-        pred = model(
-            x,
-            tod_ids=tod_ids.to(device),
-            dow_ids=dow_ids.to(device)
-        )
-    elif len(batch) == 6:
-        x, y, tod_ids, dow_ids, future_tod_ids, future_dow_ids = batch
-        x = x.to(device)
-        pred = model(
-            x,
-            tod_ids=tod_ids.to(device),
-            dow_ids=dow_ids.to(device),
-            future_tod_ids=future_tod_ids.to(device),
-            future_dow_ids=future_dow_ids.to(device)
-        )
-    else:
-        raise ValueError('Unexpected batch length: {}'.format(len(batch)))
+    x, y, tod_ids, dow_ids = batch
+    x = x.to(device)
+    pred = model(
+        x,
+        tod_ids=tod_ids.to(device),
+        dow_ids=dow_ids.to(device)
+    )
 
     return pred, y
 
@@ -176,10 +150,7 @@ def evaluate(model, dataloader, mean, std, adj, device):
 
 def load_checkpoint(model, path, device):
     state = torch.load(path, map_location=device)
-    # 兼容某些训练脚本保存 {'state_dict': ...} 的情况
-    if isinstance(state, dict) and 'state_dict' in state:
-        state = state['state_dict']
-    model.load_state_dict(state, strict=True)
+    load_tsedgca_state_dict(model, state)
 
 
 def main():

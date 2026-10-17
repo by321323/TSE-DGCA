@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-from torch.autograd import Variable
-
-# from main import device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ScaledDotProductAttention(nn.Module):
     def __init__(self):
@@ -75,7 +70,6 @@ class SATT(nn.Module):
     def __init__(self, embed_size, heads, adj, dropout, forward_expansion, T_dim, topk=None):
         super(SATT, self).__init__()
         self.adj = adj
-        self.T_dim = T_dim
         
         if topk is None:
             self.topk = max(8, int(0.05 * adj.shape[0]))
@@ -90,7 +84,6 @@ class SATT(nn.Module):
         self.norm2 = nn.LayerNorm(embed_size)
         self.norm3 = nn.LayerNorm(embed_size)
         self.norm4 = nn.LayerNorm(embed_size)
-        self.norm5 = nn.LayerNorm(embed_size)
         self.norm6 = nn.LayerNorm(embed_size)
 
         self.feed_forward = nn.Sequential(
@@ -190,7 +183,7 @@ class SATT(nn.Module):
         A_dyn = torch.softmax(score, dim=-1)
         return A_dyn
 
-    def forward(self, value, key, query, delta_hint=None):
+    def forward(self, query, delta_hint=None):
         # query: [B, N, T, C]
         B, N, T, C = query.shape
         device = query.device
@@ -296,7 +289,7 @@ class TATT(nn.Module):
             nn.Linear(forward_expansion * embed_size, embed_size),
         )
         self.dropout = nn.Dropout(dropout)
-    def forward(self, value, key, query, t):
+    def forward(self, query):
         attention = self.attention(query, query, query)
         x = self.dropout(self.norm1(attention + query))
         forward = self.feed_forward(x)
@@ -314,22 +307,17 @@ class Attention(nn.Module):
         self.fc_o = nn.Linear(h * d_v, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        self.d_model = d_model
         self.d_k = d_k
         self.d_v = d_v
         self.h = h
 
-    def forward(self, queries, keys, values, attention_mask=None, attention_weights=None):
+    def forward(self, queries, keys, values):
         b_s, nq = queries.shape[:2]
         nk = keys.shape[1]
         q = self.fc_q(queries).view(b_s, nq, self.h, self.d_k).permute(0, 2, 1, 3)  # (b_s, h, nq, d_k)
         k = self.fc_k(keys).view(b_s, nk, self.h, self.d_k).permute(0, 2, 3, 1)  # (b_s, h, d_k, nk)
         v = self.fc_v(values).view(b_s, nk, self.h, self.d_v).permute(0, 2, 1, 3)  # (b_s, h, nk, d_v)
         att = torch.matmul(q, k) / np.sqrt(self.d_k)  # (b_s, h, nq, nk)
-        if attention_weights is not None:
-            att = att * attention_weights
-        if attention_mask is not None:
-            att = att.masked_fill(attention_mask, -np.inf)
         att = torch.softmax(att, -1)
         att = self.dropout(att)
         out = torch.matmul(att, v).permute(0, 2, 1, 3).contiguous().view(b_s, nq, self.h * self.d_v)  # (b_s, nq, h*d_v)
@@ -355,8 +343,6 @@ class SmoothIncrementTemporalModule(nn.Module):
     """
     def __init__(self, embed_size, heads, dropout=0.0, forward_expansion=4):
         super(SmoothIncrementTemporalModule, self).__init__()
-
-        self.embed_size = embed_size
 
         # 1. 时间平滑层：只沿时间维做轻量平滑
         # 使用“深度卷积 + 逐点卷积”，并初始化成真正的 3 步平均平滑。
@@ -387,16 +373,7 @@ class SmoothIncrementTemporalModule(nn.Module):
         self.delta_proj = nn.Linear(embed_size, embed_size)
         self.accum_proj = nn.Linear(embed_size, embed_size)
 
-        # 3. 三类信息融合（保留原来的 fuse）
-        self.fuse = nn.Sequential(
-            nn.LayerNorm(embed_size * 3),
-            nn.Linear(embed_size * 3, embed_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_size, embed_size)
-        )
-
-        # ===== 新增：门控融合机制 =====
+        # 3. 三类信息的门控融合机制
         self.branch_gate = nn.Sequential(
             nn.LayerNorm(embed_size * 3),
             nn.Linear(embed_size * 3, embed_size),
@@ -462,7 +439,7 @@ class SmoothIncrementTemporalModule(nn.Module):
         避免越靠后的时间步数值越大。
         这里用列表 + torch.stack，避免 accum[:, :, t, :] = ... 原地写入。
         """
-        B, N, T, H = delta.shape
+        T = delta.size(2)
         decay = torch.sigmoid(self.accum_decay)
         self.last_accum_decay = decay.detach()
 
@@ -522,7 +499,7 @@ class SmoothIncrementTemporalModule(nn.Module):
         fused = self.norm_in(fused + x)
 
         # 统一时间注意力
-        out = self.temporal_attention(fused, fused, fused, 4)
+        out = self.temporal_attention(fused)
 
         out = self.dropout(self.norm_out(out + x))
 
@@ -536,41 +513,18 @@ class STBlock(nn.Module):
     def __init__(
             self,
             adj,
-            in_channels,
             embed_size,
             T_dim,
-            output_T_dim,
             heads,
             forward_expansion,
             dropout=0
     ):
         super(STBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, embed_size, 1)
-        self.conv4 = nn.Conv2d(in_channels, embed_size, 1)
-        self.conv5 = nn.Conv2d(in_channels, embed_size, 1)
         self.S = SATT(embed_size, heads, adj, dropout, forward_expansion, T_dim)
-        self.T_G = TATT(embed_size, heads, dropout, forward_expansion)
-        self.T_L = TATT(embed_size, heads, dropout, forward_expansion)
         self.norm1 = nn.LayerNorm(embed_size)
-        self.norm2 = nn.LayerNorm(embed_size)
-        self.norm3 = nn.LayerNorm(embed_size)
-        self.norm4 = nn.LayerNorm(embed_size)
         self.Att = Attention(d_model=embed_size * T_dim, d_k=embed_size * 2, d_v=embed_size * 2, h=heads, dropout=0)
-        # 缩小时间维度
-        self.conv2 = nn.Conv2d(T_dim, output_T_dim, 1)
-        # 缩小通道数，降到1维。
-        self.conv3 = nn.Conv2d(embed_size, 1, 1)
-        self.relu = nn.ReLU()
-        self.global_temporal_conv_gate1 = nn.Conv2d(embed_size, T_dim, (T_dim, 1))
-        self.global_temporal_conv_gate2 = nn.Conv2d(embed_size, T_dim, (T_dim, 1))
-        self.local_tempooral_conv_gate1 = nn.Conv2d(embed_size, T_dim, (T_dim // 3, 1))
-        self.local_tempooral_conv_gate2 = nn.Conv2d(embed_size, T_dim, (T_dim // 3, 1))
-        self.pool = nn.MaxPool2d((T_dim - T_dim // 3 + 1, 1))
-        self.fs = nn.Linear(embed_size * T_dim, embed_size * T_dim)
-        self.fg = nn.Linear(embed_size * T_dim, embed_size * T_dim)
 
-        # ===== 新增：增量驱动的时间演化模块 =====
-        # 用它替换原来的局部/全局时间卷积分支，作为 STBlock 主干时间模块。
+        # 增量驱动的时间演化模块是 STBlock 的时间主干。
         self.increment_temporal = SmoothIncrementTemporalModule(
             embed_size=embed_size,
             heads=heads,
@@ -580,7 +534,7 @@ class STBlock(nn.Module):
 
     def forward(self, x, delta_source=None):
         input_Transformer = x
-        B, N, T, H = input_Transformer.shape
+        _, N, T, H = input_Transformer.shape
 
         # delta_source 用来计算交通变化量
         # 如果没有传，就默认用当前输入
@@ -597,12 +551,7 @@ class STBlock(nn.Module):
         # 2. 空间分支仍然使用 TOD/DOW 增强后的 input_Transformer
         #    但变化量来自交通值特征
         # =========================================================
-        output_S = self.S(
-            input_Transformer,
-            input_Transformer,
-            input_Transformer,
-            delta_hint
-        )
+        output_S = self.S(input_Transformer, delta_hint)
         output_S = self.norm1(output_S + input_Transformer)
 
         # =========================================================
@@ -644,9 +593,6 @@ class TSEDGCA(nn.Module):
         # DOW: 一周中的第几天，范围 0~6
         self.use_tod = use_tod
         self.use_dow = use_dow
-        self.T_dim = T_dim
-        self.output_T_dim = output_T_dim
-        self.num_nodes = adj.shape[0]
         self.embed_size = embed_size
 
         # ===== 输入端历史 TOD/DOW 嵌入 =====
@@ -661,29 +607,12 @@ class TSEDGCA(nn.Module):
         self.calendar_emb_norm = nn.LayerNorm(embed_size)
         self.last_calendar_scale = None
 
-        # ===== 未来时间残差校正 =====
-        # 注意：不再把未来时间嵌入直接加到预测头隐藏特征上，避免扰乱输出特征分布。
-        # 这里改为：未来 TOD/DOW + 节点嵌入 -> 生成一个很小的预测残差。
-        # 这样即使未来时间信息暂时没用，也可以通过很小的 scale 自动减弱影响。
-        self.future_time_norm = nn.LayerNorm(embed_size)
-        self.future_node_emb = nn.Parameter(torch.randn(self.num_nodes, embed_size) * 0.02)
-        self.future_residual_mlp = nn.Sequential(
-            nn.LayerNorm(embed_size * 2),
-            nn.Linear(embed_size * 2, embed_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_size, 1)
-        )
-        # 初始极小：sigmoid(-5)≈0.0067，避免从 15.19 版本明显扰动。
-        self.future_time_scale = nn.Parameter(torch.tensor(-5.0))
-        self.last_future_time_scale = None
-
         self.conv1 = nn.Conv2d(in_channels, embed_size, 1)
         self.conv2 = nn.Conv2d(T_dim, output_T_dim, 1)
         self.conv3 = nn.Conv2d(embed_size, 1, 1)
         self.relu = nn.ReLU()
-        self.ST1 = STBlock(adj, in_channels, embed_size, T_dim, output_T_dim, heads, forward_expansion, dropout=dropout)
-        self.ST2 = STBlock(adj, in_channels, embed_size, T_dim, output_T_dim, heads, forward_expansion, dropout=dropout)
+        self.ST1 = STBlock(adj, embed_size, T_dim, heads, forward_expansion, dropout=dropout)
+        self.ST2 = STBlock(adj, embed_size, T_dim, heads, forward_expansion, dropout=dropout)
         self.norm1 = nn.LayerNorm(embed_size)
 
     def _prepare_tod_ids(self, tod_ids, device):
@@ -753,7 +682,7 @@ class TSEDGCA(nn.Module):
         if tod_ids is None and dow_ids is None:
             return input_Transformer
 
-        B, N, T, C = input_Transformer.shape
+        _, N, _, _ = input_Transformer.shape
         device = input_Transformer.device
         time_emb = self._build_time_embedding(tod_ids=tod_ids, dow_ids=dow_ids, device=device)
         if time_emb is None:
@@ -767,48 +696,11 @@ class TSEDGCA(nn.Module):
         time_emb = time_emb.unsqueeze(1).expand(-1, N, -1, -1)
         return input_Transformer + time_emb
 
-    def _future_calendar_residual(self, future_tod_ids=None, future_dow_ids=None, num_nodes=None, device=None):
-        """
-        未来时间残差校正。
-
-        不直接改预测头隐藏特征，而是生成一个很小的输出残差：
-            residual: [B, pre_len, N]
-        """
-        if future_tod_ids is None and future_dow_ids is None:
-            return None
-
-        future_emb = self._build_time_embedding(
-            tod_ids=future_tod_ids,
-            dow_ids=future_dow_ids,
-            device=device
-        )
-        if future_emb is None:
-            return None
-
-        future_emb = self.future_time_norm(future_emb)  # [B, pre_len, C]
-        B, T_out, C = future_emb.shape
-        N = self.num_nodes if num_nodes is None else num_nodes
-
-        # [B, pre_len, 1, C] -> [B, pre_len, N, C]
-        future_emb = future_emb.unsqueeze(2).expand(-1, -1, N, -1)
-
-        # 每个节点有自己的响应特征，避免所有节点使用完全一样的未来时间偏置。
-        node_emb = self.future_node_emb[:N].view(1, 1, N, C).expand(B, T_out, -1, -1)
-
-        residual_input = torch.cat([future_emb, node_emb], dim=-1)  # [B, pre_len, N, 2C]
-        residual = self.future_residual_mlp(residual_input).squeeze(-1)  # [B, pre_len, N]
-
-        scale = torch.sigmoid(self.future_time_scale)
-        self.last_future_time_scale = scale.detach()
-        return scale * residual
-
     def forward(
             self,
             x,
             tod_ids=None,
-            dow_ids=None,
-            future_tod_ids=None,
-            future_dow_ids=None
+            dow_ids=None
     ):
         x = x.permute(0, 2, 1).unsqueeze(1)
 
@@ -850,7 +742,4 @@ class TSEDGCA(nn.Module):
         out = self.conv3(out)               # [B, 1, N, pre_len]
         out = out.squeeze(1).permute(0, 2, 1)  # [B, pre_len, N]
 
-        # ===== E1 对照实验：关闭未来 TOD/DOW 残差 =====
-        # 保留历史 TOD/DOW 输入嵌入，但不再使用未来 TOD/DOW 修正输出。
-        self.last_future_time_scale = torch.tensor(0.0, device=out.device)
         return out
